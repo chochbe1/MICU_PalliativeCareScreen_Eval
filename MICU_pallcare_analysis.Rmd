@@ -1,0 +1,1702 @@
+---
+title: "MICU_PallCare_Analysis"
+author: "Chad Hochberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#To run updated analysis first run:
+#'alternate_admit_day.R' script
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table) #Fast Data Manipulation
+library(tableone) #Create Tables
+library(here) #Simplify path direction
+library(readxl)
+library(DescTools)
+library(collapse) #Fast Data Manipulation
+library(arrow) #Data Management with Parquet Files
+library(patchwork) #Organizing Figures
+library(ivreg) #package for IV analysis
+library(sandwich) #Needed for Robust Standard Errors
+library(lmtest) #Needed For Standard Error Estimation
+library(gridExtra) #Organizing Figures
+library(survey) #Needed for Creating Tables with Clustered Standard Errors
+library(multcomp) #Can use 'general linear hypothesis function' for interaction term
+
+`%!in%` <- Negate(`%in%`)
+
+#Set Working Directory
+setwd("~/workspace/Storage/chochbe1/persistent/pall_care_eval")
+select <- dplyr::select
+
+here::i_am('pall_here.R')
+```
+
+```{r Implement Inclusion/Exclusion Criteria}
+#Inclusion is the Date Range Indicated 10/04/2021 - 10/04/2023
+pall_df <- pall_df |>
+  filter(icu_in_dttm>='2021-10-04' & icu_in_dttm<'2023-10-04') |>
+  relocate(Is_VasoSup6Hr, .after = Is_HepEnceph)
+cat('\n', dim(pall_df)[1], 'ICU Encounters During Date Range')
+
+#Exclusion: 
+#1: Only include the 1st ICU stay for a patient for each hospitalization
+#2: 'No CPR - Palliative and Supportive Care' within 6 Hours of Admission
+#3: <12 Hours Between ICU Admission and Discharge
+#4: Had billing code for palliative care prior to icu_in_dttm
+
+#1
+n <- dim(pall_df)[1] #Keep Track of Length and How Many Encounters are Excluded
+pall_df <- pall_df |>
+  group_by(pat_enc_csn_id) |>
+  arrange(icu_in_dttm) |>
+  mutate(icu_number=row_number()) |>
+  mutate(total_icu_admits=max(icu_number)) |> #Keeps Track of the Total Number of ICU Stays per Patient Encounter
+  filter(icu_number==1) |>
+  ungroup()
+cat('\n', n-dim(pall_df)[1], 'Excluded Additional ICU Stays in Same Encounter')
+
+#2
+n <- dim(pall_df)[1] #Keep Track of Length and How Many Encounters are Excluded
+pall_df <- pall_df |>
+  filter(CodeStatus_in6HrAfterICUAdm!='No CPR - Palliative and Supportive Care')
+cat('\n', n-dim(pall_df)[1], 'Excluded For Comfort Care STatus in 1st 6 Hours')
+n <- dim(pall_df)[1]
+
+#3
+pall_df <- pall_df |>
+  filter(icu_los>=0.5)
+cat('\n', n-dim(pall_df)[1], 'Excluded For < 12 Hours Between ICU Admission and ICU Discharge')
+n <- dim(pall_df)[1]
+
+#4 Billing COde or Palliative Care Consult
+pall_df <- pall_df |>
+  filter(is.na(PCC_firstDttm_HospEnc_byBill) | PCC_firstDttm_HospEnc_byBill>icu_in_dttm) |>
+  filter(is.na(firstDate_NoteType_Consults) | firstDate_NoteType_Consults>date_admit)
+cat('\n', n-dim(pall_df)[1], 'Excluded For Palliative Care Bill Prior to ICU')
+n <- dim(pall_df)[1]
+
+```
+
+#Exploratory Data Analysis
+```{r}
+#First and Last ICU Start Dates
+pall_df <- pall_df |> arrange(icu_in_dttm)
+print('First ICU Admit Date')
+first(pall_df$icu_in_dttm)
+
+print('Last ICU Admit Date')
+last(pall_df$icu_in_dttm)
+
+#Create Pre-Post Consult Implementation Variables
+pall_df <- pall_df |> 
+  mutate(post_pallimp=fifelse(
+    icu_in_dttm>='2022-10-04', 1, 0
+  ))
+print('First ICU Admit Dates in Pre and Post Implementation Periods')
+first(pall_df$icu_in_dttm[pall_df$post_pallimp==0])
+first(pall_df$icu_in_dttm[pall_df$post_pallimp==1])
+
+print('How Many Unique Patients the Pre and Post era?')
+cat('Unique Patients in Pre-implementation Period: ', 
+    length(unique(pall_df$cohort_id[pall_df$post_pallimp==0])))
+cat('\nUnique Patients in Post-implementation Period', length(unique(pall_df$cohort_id[pall_df$post_pallimp==1])))
+                                                                
+print('How Many ICU Encounters in the Pre and Post era?')
+cat('ICU Encounters in Pre-implementation Period:', 
+    sum(pall_df$post_pallimp == 0))
+cat('\n','Encounters in Post-implementation Period:', 
+    sum(pall_df$post_pallimp == 1))
+cat('\n')
+
+#Create a Binary 0=No, 1=Yes for met any pallcare trigger
+temp <- names(pall_df)[16:29] #Create a Vector of the Variables You Want to Sum
+pall_df <- pall_df %>%
+     mutate(total_triggers = rowSums(select(., all_of(temp)), na.rm = TRUE)) %>%
+     mutate(any_trigger=fifelse(total_triggers>0, 1, 0))
+
+#Number of Those Meeting Trigger for Palliative Care Consultation By Period
+print('Table of Meeting Any Palliative Trigger (0,1) by Pre/Post(0,1) Implementation')
+PercTable(table(pall_df$any_trigger, pall_df$post_pallimp), rfrq = '001', margins = 2)
+```
+
+```{r Create Outcome Variables}
+#Primary Outcome: Time to Code Status Escalation or ICU Discharge (will analyze with death without code status escalation as competing risk)
+#Secondary Outcomes: ICU Length of Stay, Hospital Length of STay, In-ICU Cardiac Arrest, Discharge to Hospice, 30-day All-location mortality
+
+#Will need to Pull in Death Date
+death_date <- read_parquet(here::here('data', '20240326_death_date_palldf')) |> ungroup() |>
+  select(cohort_id, death_date)
+pall_df <- pall_df |> 
+  join(death_date, how = 'left') |>
+  #Redefine inhosp_death
+  mutate(inhosp_death=fifelse(
+    Discharge_Disp %in% 
+      c('Expired',
+        'Expired Medical Facility-hospital, SNF, ICF, free standing hospice-claim for hospice', 
+        'Expired - Place Unknown (Medicare and TRICARE claims for hospice care)'), 1, 0
+  )) |>
+  #Now Define Death THat Occurs After Hospitalization 
+  mutate(dead=fcase(
+    inhosp_death==1, 1,
+    inhosp_death==0 & !is.na(death_date), 1,
+    inhosp_death==0 & is.na(death_date), 0
+  )) |>
+  mutate(death_date=fifelse(
+    inhosp_death==1, hosp_disch_time, death_date)) |>
+ relocate(death_date, .after = dead) |>
+ #Now Create Death Within 30 Days of icu_in_dttm (Yes/No as well as Time to Death)
+  mutate(death30=fcase(
+    dead==1 & as.duration(death_date-icu_in_dttm)<=ddays(30), 1,
+    dead==0, 0,
+    dead==1 & as.duration(death_date-icu_in_dttm)>ddays(30), 0 
+  )) |>
+  mutate(death_time30=fcase(
+    death30==0, 30,
+    death30==1, as.duration(death_date-icu_in_dttm)/ddays(1)
+  ))
+
+#Define in ICU Death
+pall_df <- pall_df |>
+  #Define in ICU Death 
+  #For those who die in hospital and icu out doesn't equal discharge time will define as Less than 6 hours between icu_out_dttm and hosp_disch; can be a lag between death and formal dc from hospital
+  mutate(in_icu_death=fcase(
+    inhosp_death==1 & icu_out_dttm==hosp_disch_time, 1,
+    inhosp_death==1 & as.duration(hosp_disch_time-icu_out_dttm)<=dhours(6), 1,
+    inhosp_death==1 & as.duration(hosp_disch_time-icu_out_dttm)>dhours(6), 0,
+    inhosp_death==0, 0)) 
+
+#Primary Outcome: Days to Code Status Escalation or ICU Discharge with In Hospital Death Without Code Stat Change Placed  at 99th Percentile
+#First Define dnr_icudc_days (not accounting for deaths)
+pall_df <- pall_df |>
+  mutate(dnr_icudc_days=fcase(
+    is.na(CodeStatus_EscalOrd_upDttm), icu_los, #If there is No Code Status Escalation Than ICU LOS in Days is the Time
+    !is.na(CodeStatus_EscalOrd_upDttm) & icu_out_dttm>=CodeStatus_EscalOrd_upDttm, 
+          as.duration(CodeStatus_EscalOrd_upDttm-icu_in_dttm)/ddays(1),
+    !is.na(CodeStatus_EscalOrd_upDttm) & icu_out_dttm<CodeStatus_EscalOrd_upDttm, 
+        icu_los
+  )) |>
+  #Limited to 30 Days
+  mutate(dnr_icudc_days30=fcase(
+    dnr_icudc_days>30, 30,
+    dnr_icudc_days<=30, dnr_icudc_days
+  ))
+print('Summary of Days to DNR or ICU Discharge')
+summary(pall_df$dnr_icudc_days)
+print('Summary of Days to DNR or ICU Discharge, by Day 30')
+summary(pall_df$dnr_icudc_days30)
+
+#Now place death at 99th Percentile of Distribution (for Each Period Separately)
+#Define In Hospital Death Without Code Status Change
+pall_df <- pall_df |>
+  mutate(death_no_dnr=fcase(
+    inhosp_death==1 & is.na(CodeStatus_EscalOrd_upDttm), 1,
+    inhosp_death==0, 0,
+    inhosp_death==1 & !is.na(CodeStatus_EscalOrd_upDttm), 0
+  )) 
+
+#Distribution of DNR-ICU Days
+#Post Implementation
+df_post <- pall_df |> filter(post_pallimp==1)
+summary(df_post$dnr_icudc_days[df_post$death_no_dnr==0])
+post99 <- print(quantile(df_post$dnr_icudc_days[df_post$death_no_dnr==0], probs = c(0.99)))
+#Pre Implementation
+df_pre <- pall_df |> filter(post_pallimp==0)
+summary(df_pre$dnr_icudc_days[df_pre$death_no_dnr==0])
+pre99 <- print(quantile(df_pre$dnr_icudc_days[df_pre$death_no_dnr==0], probs = c(0.99)), na.rm = TRUE)
+
+#Place In Hospital Death Without Code Status Escalation at 99th Percentile
+pall_df <- pall_df |>
+  mutate(dnr_icudc_outcome=fcase(
+    death_no_dnr==0, dnr_icudc_days,
+    death_no_dnr==1 & post_pallimp==1, post99,
+    death_no_dnr==1 & post_pallimp==0, pre99
+  ))
+
+#Examine Distributions of Outcome and Log Transformed Outcome
+hist(pall_df$dnr_icudc_outcome[pall_df$post_pallimp==0], 
+    main='Pre Implementation Period', xlab='Days to DNR or ICU DC')
+hist(log(pall_df$dnr_icudc_outcome[pall_df$post_pallimp==0]), 
+    main='Pre Implementation Period', xlab='Log Days to DNR or ICU DC')
+#Transformed Variable Has Approximately Normal Distribubtion
+hist(pall_df$dnr_icudc_outcome[pall_df$post_pallimp==1], 
+    main='Post Implementation Period', xlab='Days to DNR or ICU DC')
+hist(log(pall_df$dnr_icudc_outcome[pall_df$post_pallimp==1]), 
+    main='Post Implementation Period', xlab='Log Days to DNR or ICU DC')
+#Transformed Variable Has Approximately Normal Distribution
+ 
+pall_df <- pall_df |>
+  mutate(screen_factor=fcase(
+    pall_2day_note==1, "Screened",
+    pall_2day_note==0, "Not Screened"
+  )) |>
+  mutate(pc_bill_factor=fcase(
+    pall_2day_bill==1, "PC Consult",
+    pall_2day_bill==0, "No PC Consult"
+  ))
+df_post <- pall_df |> filter(post_pallimp==1) |>
+  mutate(dnr_icudc_outcome=round(dnr_icudc_outcome)) |>
+  mutate(dnr_icudc_outcome=fifelse(
+    dnr_icudc_outcome>=40, 40, dnr_icudc_outcome
+  ))
+df_pre <- pall_df |> filter(post_pallimp==0) |>
+  mutate(dnr_icudc_outcome=round(dnr_icudc_outcome)) |>
+  mutate(dnr_icudc_outcome=fifelse(
+    dnr_icudc_outcome>=40, 40, dnr_icudc_outcome
+  ))
+post <- ggplot(df_post, 
+               aes(x = dnr_icudc_outcome, group = pall_2day_note,
+                   fill = as.factor(screen_factor))) +
+  geom_bar(stat = 'count', position = 'dodge') +
+  scale_x_continuous(breaks=seq(0,40,by=5), 
+                     labels=c('0','5','10','15','20','25','30','35','40+'),
+                     name = 'Days to DNR or ICU Discharge') +
+  scale_y_continuous(breaks=seq(0,175, by=25),
+                     name='Count') +
+  scale_fill_grey(start=0.8, end=0.2, name = 'Screening Status') +
+  theme_bw() +
+  guides(fill = guide_legend(position = 'inside')) +
+  theme(legend.position.inside = c(0.65,0.65))
+post
+cairo_pdf("graphs/DNR-ICU_Discharge_Distribution_PostImp.pdf", height = 6.34, width =  4.83)
+print(post)
+dev.off()
+
+pre <- ggplot(df_pre, 
+       aes(x = dnr_icudc_outcome, group = pall_2day_note,
+           fill = as.factor(screen_factor))) +
+  geom_bar(stat = 'count', position = 'dodge') +
+  scale_x_continuous(breaks=seq(0,40,by=5), 
+          labels=c('0','5','10','15','20','25','30','35','40+'),
+    name = 'Days to DNR or ICU Discharge') +
+  scale_fill_grey(start=0.8, end=0.2, name = 'Screening Status') +
+  ggtitle('Pre Pall Care Implementation') +
+  theme_classic()
+pre
+ggsave('DNR-ICU_Discharge_Distribution_PreImp.pdf',
+       path='graphs/')
+
+print(plot1 <- pre+ post + plot_layout(guides = 'collect', nrow = 2))
+ggsave('DNR-ICU_Discharge_Distribution_Combined.pdf',
+       path='graphs/')
+
+#Show Distribution by Pre/Post Period
+df <- pall_df |>
+  mutate(dnr_icudc_outcome=round(dnr_icudc_outcome)) |>
+  mutate(dnr_icudc_outcome=fifelse(
+    dnr_icudc_outcome>=40, 40, dnr_icudc_outcome
+  ))
+ggplot(df, 
+       aes(x = dnr_icudc_outcome, group = post_pallimp,
+           fill = as.factor(post_pallimp))) +
+  geom_bar(stat = 'count', position = 'dodge') +
+  scale_x_continuous(breaks=seq(0,40,by=5), 
+          labels=c('0','5','10','15','20','25','30','35','40+'),
+    name = 'Days to DNR or ICU Discharge') +
+  scale_fill_grey(start=0.8, end=0.2, name = 'Period', 
+                  labels = c('Pre-Implementation', 'Post-Implementation')) +
+  ggtitle('Distribution of Days to DNR or ICU Discharge by Period') +
+  theme_classic()
+ggsave('DNR-ICU_Discharge_Distribution_ByPeriod.pdf',
+       path='graphs/')
+
+####SECONDARY OUTCOMES
+#ICU LOS with Death Placed at the 99th Percentile
+print('Summary and 99th Percentile for ICU LOS in Post Implementation Period')
+summary(pall_df$icu_los[pall_df$post_pallimp==1])
+post99 <- print(quantile(pall_df$icu_los[pall_df$post_pallimp==1], probs = c(0.99)))
+print('Summary 99th Percentile for ICU LOS in Pre Implementation Period')
+summary(pall_df$icu_los[pall_df$post_pallimp==0])
+pre99 <- print(quantile(pall_df$icu_los[pall_df$post_pallimp==0], probs = c(0.99), na.rm = TRUE))
+
+pall_df <- pall_df |>
+  mutate(icu_los_outcome=fcase(
+    inhosp_death==0, icu_los,
+    inhosp_death==1 & post_pallimp==1, post99,
+    inhosp_death==1 & post_pallimp==0, pre99
+  ))
+print('Summary of ICU LOS Outcome with Placement of In-hsopital Death Ranked at 99th Percentile')
+summary(pall_df$icu_los_outcome)
+
+#Hospital LOS with Death Placed at the 99th Percentile
+print('Summary and 99th Percentile for Hospital LOS in Post Implementation Period (Time Zero is ICU Admit)')
+summary(pall_df$hosp_los[pall_df$post_pallimp==1])
+post99 <- print(quantile(pall_df$hosp_los[pall_df$post_pallimp==1], probs = c(0.99), na.rm = TRUE))
+print('Summary 99th Percentile for Hospital LOS in Pre Implementation Period')
+summary(pall_df$hosp_los[pall_df$post_pallimp==0])
+pre99 <- print(quantile(pall_df$hosp_los[pall_df$post_pallimp==0], probs = c(0.99), na.rm = TRUE))
+
+pall_df <- pall_df |>
+  mutate(hosp_los_outcome=fcase(
+    inhosp_death==0, hosp_los,
+    inhosp_death==1 & post_pallimp==1, post99,
+    inhosp_death==1 & post_pallimp==0, pre99
+  ))
+
+print('Summary of ICU LOS Outcome with Placement of In-hsopital Death Ranked at 99th Percentile')
+summary(pall_df$hosp_los_outcome)
+
+#Discharge to Hospice (Yes/No)
+pall_df <- pall_df |>
+  mutate(dc_hospice=fifelse(
+    Discharge_Disp %in% c('Home Hospice', 'Hospice Facility', 'Hospice Home', 'Inpatient Hospice'), 1, 0
+  )) |>
+  #If Discharge_Disp missing, keep dc_hospice missing
+  mutate(dc_hospice=fifelse(
+    is.na(Discharge_Disp), NaN, dc_hospice
+  ))
+
+#Change in CODE STatus to MOre Limited Form
+pall_df <- pall_df |>
+  mutate(to_dnr=fifelse(
+    is.na(CodeStatus_EscalOrd_upDttm), 0, 1)) 
+
+rm(pre, post, df, df_post, df_pre, plot1, death_date, pre99, post99)
+```
+
+#Describe Cohort - Table 1
+```{r}
+#Describe Cohort in Table1 - Separate Pre and Post IMplementation Periods
+to_tab <- c('Age_ICUAdm', 
+            'genderabbr',
+            'race',
+            'hispanic',
+            'elix_number',
+            'Ind_Mortality',
+            'preicu_loc',
+            'any_trigger',
+            'total_triggers',
+            'n_HospAdm_prior12Mon',
+            'maxsofa_day1_2',
+            'Is_AcuRespFail',
+            'Is_VasoSup6Hr',
+            'CodeStatus_in6HrAfterICUAdm',
+            'sat_sun',
+            'trigger_pat_d01',
+            'total_icu_admits', 
+            'n_patients')
+factors_tab <- c('genderabbr', 'race', 'hispanic', 'preicu_loc', 'any_trigger', 'CodeStatus_in6HrAfterICUAdm', 'sat_sun', 
+                 'Is_AcuRespFail', 'Is_VasoSup6Hr')
+nonnorm <- c('Age_ICUAdm', 
+            'elix_number',
+            'total_triggers',
+            'n_HospAdm_prior12Mon',
+            'maxsofa_day1_2',
+            'total_icu_admits',
+            'Ind_Mortality',
+            'trigger_pat_d01')
+
+#Now Create Table 1 for Post_implementation Period and Stratified by Receipt of Palliative Care Within 2 Days (by Note)
+df <- pall_df |> filter(post_pallimp==1) 
+#Create Survey Design Object with Clustering at the Cohort ID level
+df_clust <- svydesign(data = df, ids = df$cohort_id)
+tab1 <- svyCreateTableOne(data=df_clust, vars = to_tab, factorVars = factors_tab)
+summary(tab1)
+#Now Create a Traditional Table 1, Using Non-parametric Testing, Stratified by Pall 2 Day Note
+tab1 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Post-Implementation Period Table 1')
+print(tab1, nonnormal=nonnorm)
+tab1_excel <- print(tab1, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_pallrecieved2d_note_postimp.csv")
+ExtractSmd(tab1)
+rm(tab1_excel)
+
+#Repeat for The Pre-Implementation Period
+df <- pall_df |> filter(post_pallimp==0) 
+df_clust <- svydesign(data = df, ids = df$cohort_id)
+#Now Create a Traditional Table 1, Using Non-parametric Testing, Stratified By Pall Care Note Within 2 Days
+tab1 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print("Pre-Implementation Table 1")
+print(tab1, nonnormal=nonnorm)
+tab1_excel <- print(tab1, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_pallrecieved2d_note_preimp.csv")
+rm(tab1_excel, tab1)
+
+```
+
+
+```{r Table for Palliative Care Process Outcomes}
+to_tab <- c('pall_2day_note', 
+            'pall_2day_bill',
+            'pall_3day_note', 
+            'pall_3day_bill',
+            'pall_1day_note', 
+            'pall_1day_bill',
+            'pall_received_bill',
+            'daysto_pc_note',
+            'daysto_pc_bill',
+            'pallrec2d_palltrigger_note',
+            'pallrec2d_palltrigger_bill',
+            'pallrec_palltrigger_note',
+            'pallrec_palltrigger_bill',
+            'pallbill_afternote')
+factors_tab <- c('pall_2day_note', 
+            'pall_2day_bill',
+            'pall_3day_note', 
+            'pall_3day_bill',
+            'pall_1day_note', 
+            'pall_1day_bill',
+            'pall_received_bill',
+            'pallrec2d_palltrigger_note',
+            'pallrec2d_palltrigger_bill',
+            'pallrec_palltrigger_note',
+            'pallrec_palltrigger_bill',
+            'pallbill_afternote')
+nonnorm <- c('daysto_pc_note',
+            'daysto_pc_bill')
+
+#Now Create Table for Palliative Care Process Variables Stratified by Pre-Post Implementation Periods
+tab2 <- CreateTableOne(data=pall_df, vars = to_tab, factorVars = factors_tab)
+summary(tab2)
+#Now Process Table Stratified by Period
+df_clust <- svydesign(data = pall_df, ids = pall_df$cohort_id)
+tab2 <- svyCreateTableOne(vars = to_tab, strata="post_pallimp", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Palliative Care Process Variables by Pre/Post Implementation Periods')
+print(tab2, nonnormal=nonnorm)
+tab2_excel <- print(tab2, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab2_excel, file="tables/table_pall_processes.csv")
+
+#Table2 Stratified by Received Pall Screening or Not in POST implementation period
+df <- pall_df |> filter(post_pallimp==1)
+df_clust <- svydesign(data = df, ids = df$cohort_id)
+tab2 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Palliative Care Process Variables by Pre/Post Implementation Periods')
+print(tab2, nonnormal=nonnorm)
+tab2_excel <- print(tab2, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab2_excel, file="tables/table_pall_processes_post_by_note.csv")
+rm(tab2_excel, tab2)
+
+```
+
+```{r Evaluate Outcome Variables for Table 3}
+to_tab <- c('dnr_icudc_days',
+            'dnr_icudc_outcome',
+            'icu_los_outcome',
+            'hosp_los_outcome',
+            'dc_hospice',
+            'death30',
+            'inhosp_death',
+            'in_icu_death',
+            'to_dnr')
+factors_tab <- c('dc_hospice',
+            'death30',
+            'inhosp_death',
+            'in_icu_death',
+            'to_dnr')
+nonnorm <- c('dnr_icudc_days',
+             'dnr_icudc_outcome',
+            'icu_los_outcome',
+            'hosp_los_outcome')
+
+#Now Outcome Table Stratified by Period
+df_clust <- svydesign(data = pall_df, ids = pall_df$cohort_id)
+tab3 <- svyCreateTableOne(vars = to_tab, strata="post_pallimp", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Palliative Care Outcome Variables by Pre/Post Implementation Periods')
+print(tab3, nonnormal=nonnorm)
+tab3_excel <- print(tab3, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab3_excel, file="tables/table_pall_patient_outcomes.csv")
+
+#Now Outcome Table Stratified by Pall Care Note within 2 Days
+df_pre <- pall_df |> filter(post_pallimp==0)
+df_clust <- svydesign(data = df_pre, ids = df_pre$cohort_id)
+tab3 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Patient Outcomes - Preimplemenation by Pall Care REceipt Status')
+print(tab3, nonnormal=nonnorm)
+tab3_excel <- print(tab3, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab3_excel, file="tables/table_pall_patient_outcomes_preimp.csv")
+
+#Now Stratify by Pall Care Billing in First Two Days, Pre-Implementation
+tab3 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_bill", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Patient Outcomes - Preimplemenation by Pall Care Billing Status')
+print(tab3, nonnormal=nonnorm)
+tab3_excel <- print(tab3, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab3_excel, file="tables/table_pall_patient_outcomes_preimp_bybill.csv")
+
+#Repeat for Post implemntation Period
+df_post <- pall_df |> filter(post_pallimp==1)
+df_clust <- svydesign(data = df_post, ids = df_post$cohort_id)
+tab3 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Patient Outcomes - Post-implemenation by Pall Care REceipt Status')
+print(tab3, nonnormal=nonnorm)
+tab3_excel <- print(tab3, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab3_excel, file="tables/table_pall_patient_outcomes_postimp.csv")
+
+tab3 <- svyCreateTableOne(vars = to_tab, strata="pall_2day_bill", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Patient Outcomes - Post-implemenation by Pall Care Billing Status')
+print(tab3, nonnormal=nonnorm)
+tab3_excel <- print(tab3, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab3_excel, file="tables/table_pall_patient_outcomes_postimp_bybill.csv")
+
+rm(tab3_excel, tab3)
+```
+```{r Evaluate Relationship Between Continuous Covariates and Outcomes}
+#POST IMPLEMENATION PERIOD
+fn.histo_associate <- function(df, var, outcome) {
+  ggplot(df, 
+       aes(x = var, y = log(outcome))) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth() +
+  labs(x = name, y = outcome_name, size = 0.1) +
+  theme(axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7)
+  )
+}
+outcome_name <- "DNR or ICU Discharge \n Days (Log Scale)"
+name <- "Age"
+p1 <- fn.histo_associate(df_post, df_post$Age_ICUAdm, df_post$dnr_icudc_outcome)
+name <- "Max Daily SOFA"
+p2 <- fn.histo_associate(df_post, df_post$maxsofa_day1_2, df_post$dnr_icudc_outcome)
+name <- "Elixhauser Count"
+p3 <- fn.histo_associate(df_post, df_post$elix_number, df_post$dnr_icudc_outcome)
+name <- "Elixhauser Mortality Index"
+p4 <- fn.histo_associate(df_post, df_post$Ind_Mortality, df_post$dnr_icudc_outcome)
+plot1 <- grid.arrange(p1,p2,p3,p4,
+                      nrow = 2,
+                      top = "DNR or ICU DC and Covariate Associations")
+
+ggsave("DNRICUDC_Covariate_Associations.pdf",
+       plot = plot1,
+       device = "pdf",
+       path=("graphs/"))
+
+rm(p1, p2, p3)
+```
+
+
+#Evaluate Criteria for Instrument (Z) in terms of relationship to exposure (A)
+#i: Z is associated A
+#ii: Z does not cause Y except through A
+#iii: Z&Y do not Share Common Causes
+#iv: Monoticity: CACE
+#Can only empirically evaluate i; will perform some falsification tests to provide support for ii
+```{r}
+#Association of receipt of pall care within 2 days and Number of ICU Admissions Meeting Trigger on Admit Day and Admit Day + 1 'trigger_pat_d01'
+print('Table of Receipt of Palliative Care Within 2 Days and Number of Admissions Meeting Criteria')
+PercTable(table(pall_df$pall_2day_note, pall_df$trigger_pat_d01), rfrq = '001')
+chisq.test(table(pall_df$pall_2day_note, pall_df$trigger_pat_d01))
+fisher.test(table(pall_df$pall_2day_note, pall_df$trigger_pat_d01), simulate.p.value=TRUE)
+
+PercTable(table(df_post$pall_2day_note, df_post$trigger_pat_d01), rfrq = '001')
+chisq.test(table(df_post$pall_2day_note, df_post$trigger_pat_d01))
+fisher.test(table(df_post$pall_2day_note, df_post$trigger_pat_d01), simulate.p.value=TRUE)
+
+#Association of Pall Care Screening and 'Weekend'
+print('Table of Receipt of Palliative Care Screening Within 2 Days and Admission on a Weekend')
+PercTable(table(pall_df$pall_2day_note, pall_df$sat_sun), rfrq = '001')
+chisq.test(table(pall_df$pall_2day_note, pall_df$sat_sun))
+
+PercTable(table(df_post$pall_2day_note, df_post$sat_sun), rfrq = '001')
+chisq.test(table(df_post$pall_2day_note, df_post$sat_sun))
+
+ggplot(pall_df, 
+       aes(trigger_pat_d01, fill = factor(screen_factor))) +
+  geom_bar(aes(y=..prop..), stat='count', position = 'dodge') +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), limits = c(0, 0.3), labels=scales::percent) +
+  scale_x_continuous(breaks=seq(0,14, by=1)) +
+  scale_fill_grey(start=0.8, end=0.2, name = 'Screening Status') +
+  xlab('No. of Admits Qualifying for PCC') +
+  ylab('Relative Proportion') +
+  theme_classic()
+ggsave('Distribution_NoPCCDays.pdf',
+       path='graphs/')
+
+#Now Stratified by Pre and Post Implementation Period
+pre <- ggplot(df_pre, 
+       aes(trigger_pat_d01, fill = factor(screen_factor))) +
+  geom_bar(aes(y=..prop..), stat='count', position = 'dodge') +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), limits = c(0, 0.3), labels=scales::percent) +
+  scale_x_continuous(breaks=seq(0,14, by=1)) +
+  scale_fill_grey(start=0.8, end=0.2, name = 'Screening Status') +
+  xlab('No. of Admits Qualifying for PCC') +
+  ylab('Relative Proportion') +
+  ggtitle('Pre Palliative Implementation') +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+post <- ggplot(df_post, 
+       aes(trigger_pat_d01, fill = factor(screen_factor))) +
+  geom_bar(aes(y=..prop..), stat='count', position = 'dodge') +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), limits = c(0, 0.3), labels=scales::percent) +
+  scale_x_continuous(breaks=seq(0,14, by=1)) +
+  scale_fill_grey(start=0.8, end=0.2, name = 'Screening Status') +
+  xlab('No. of Admits Qualifying for PCC') +
+  ylab('Relative Proportion') +
+  ggtitle('Post Palliative Implementation') +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(plot1 <- pre + post + plot_layout(guides = 'collect', ncol = 1))
+ggsave('Distribution_NoPCCDays_byPeriod.pdf',
+       path='graphs/')
+rm(post, pre, plot1)
+
+#Plot % Receiving Palliative Care Within 2 Days by NO of ICU admits Meeting Trigger
+df <- pall_df |> 
+  filter(post_pallimp==1) |>
+  group_by(trigger_pat_d01) |>
+  mutate(perc_pall = mean(pall_2day_note, na.rm = TRUE)) |>
+  mutate(no_patients=n()) |>
+  select(perc_pall, trigger_pat_d01, no_patients) |>
+  filter(row_number()==1)
+  
+
+ggplot(df, aes(x = trigger_pat_d01, y = perc_pall)) +
+  geom_bar(stat = 'identity')+
+  scale_y_continuous(breaks=seq(0,1, by=0.10), limits = c(0, 1.00), labels=scales::percent) +
+  scale_x_continuous(breaks=seq(0,14, by=1)) +
+  xlab('No. of Admits Qualifying for PCC') +
+  ylab('% Receiving PC Screening within 2 Days') +
+  theme_classic()
+ggsave('PercPall2days_NoPCCDays_PostImp.pdf',
+       path='graphs/')
+
+#Plot % Receiving Palliative Care Within 2 Days by NO of ICU admits Meeting Trigger Stratified by Period
+#Create Data Frame with Two Rows for Each Number of Trigger Patients Day 01; One for Pre and One for Post IMplementation
+plot_df <- data.frame(
+  trigger_pat_d01 = rep(1:14, each = 2),
+  post_pallimp= rep(c('Post-Implementation', 'Pre-Implementation'), times = 14))
+
+#Now Calculate Number of Admits and the Percent Who Receive Pall Care Screening
+df <- pall_df |> 
+  mutate(post_pallimp=factor(post_pallimp, levels = c('0', '1'),
+                             labels = c('Pre-Implementation', 'Post-Implementation'))) |>
+  group_by(trigger_pat_d01, post_pallimp) |>
+  mutate(perc_pall = mean(pall_2day_note, na.rm = TRUE)) |>
+  mutate(n_admits=n()) |>
+  filter(row_number()==1) |>
+  select(perc_pall, trigger_pat_d01, post_pallimp, n_admits) 
+
+#Merge with Plot DF so For those Levels of trigger_patday_01 that Have 0 Admits, they are Still Represented
+plot_df <- plot_df |> left_join(df) |>
+  mutate(n_admits=fifelse(is.na(n_admits), 0, n_admits)) |>
+  mutate(scale_admits=(n_admits/1000)*2) |>
+  mutate(post_pallimp=factor(post_pallimp, levels = c('Pre-Implementation', 'Post-Implementation'), ordered = TRUE))
+
+#Now Plot
+ggplot(plot_df, 
+            aes(x=factor(trigger_pat_d01), y=perc_pall, group = post_pallimp)) +
+  geom_bar(aes(x=factor(trigger_pat_d01), y=scale_admits, fill = post_pallimp),
+           stat = 'identity', position = 'dodge', show.legend = TRUE, alpha = 0.55) +
+  geom_line(aes(colour = post_pallimp, 
+                linetype = post_pallimp), linewidth = 1.125) +
+  geom_point(aes(colour = post_pallimp)) +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), labels = scales::percent, limits = c(0,1),
+                     name = 'PC Screen w/in 2 Days',
+          sec.axis = sec_axis(trans = ~.*100, 
+          name = '                                 Admission Count',
+          breaks=seq(0,50, by = 10),
+          labels = c('0','50', '100','150', '200', '250'))) +
+  scale_x_discrete(breaks=seq(1,14, by=1), 
+                     name = 'No. of ICU Admits Meeting \n Palliative Screening Criteria, ICU Days 1 and 2') +
+  scale_color_manual(values = c("red",  
+                                "black"),
+                     name= 'PC Screen w/in 2 Days') +
+  scale_linetype_manual(values=c('twodash', 'solid'),
+                        name= 'PC Screen w/in 2 Days') +
+  scale_fill_grey(start=0.8, end=0.2, aesthetics = c("fill"),
+                  name= 'No. of Admits') +
+  theme_classic() +
+  theme(panel.grid.major = element_line(color = "lightgrey",
+                                        linewidth =  0.1,
+                                        linetype = 1),
+        legend.title = element_text(size=8),
+        legend.text= element_text(size=8))
+
+ggsave('PercPall2days_NoPCCDays_ByPeriod.pdf',
+       path='graphs/')
+
+plot_df_post <- plot_df |> filter(post_pallimp=='Post-Implementation')
+
+plot_post <- ggplot(plot_df_post, 
+       aes(x=factor(trigger_pat_d01), y=perc_pall, group = post_pallimp)) +
+  geom_bar(aes(x=factor(trigger_pat_d01), y=scale_admits),
+           stat = 'identity', position = 'dodge', show.legend = TRUE, fill = "darkgrey") +
+  geom_line(aes(x=factor(trigger_pat_d01), y=perc_pall), color = 'black', linetype = 'solid', linewidth = 1.4) +
+  geom_point(color = 'black') +
+  scale_y_continuous(breaks=seq(0,1, by=0.1), labels = scales::percent, limits = c(0,1),
+                     name = 'Early PC Screen',
+                     sec.axis = sec_axis(trans = ~.*100, 
+                                         name = '                                 Admission Count',
+                                         breaks=seq(0,50, by = 10),
+                                         labels = c('0','50', '100','150', '200', '250'))) +
+  scale_x_discrete(breaks=seq(1,14, by=1), 
+                   name = 'No. of ICU Admits Meeting \n Palliative Screening Criteria, ICU Days 1 and 2') +
+  scale_fill_grey(start=0.8, end=0.2, aesthetics = c("fill"),
+                  name= 'No. of Admits') +
+  theme_classic() +
+  theme(panel.grid.major = element_line(color = "lightgrey",
+                                        linewidth =  0.01,
+                                        linetype = 1),
+        legend.title = element_text(size=8),
+        legend.text= element_text(size=8))
+cairo_pdf("graphs/figure2.pdf", height = 4.8, width =  9)
+print(plot_post)
+dev.off()
+
+```
+
+```{r Falsification Tests}
+#Further Evaluate Instruments Using Falsification Test
+#1st Evaluate Whether Outcome is Associated with Instrument (2nd Stage Equation WITHOUT treatment) in PRE implementation population
+df_pre <- pall_df |> filter(post_pallimp==0)
+false_mod <- lm(log(dnr_icudc_outcome) ~ trigger_pat_d01 + sat_sun, 
+                data=df_pre, family = gaussian())
+summary(false_mod)
+#Get Corrected P-value, Exponentiated Coefficients and Confindence Intervals
+coeftest(false_mod, vcov = vcovCL, cluster = df_pre$cohort_id)
+exp(coef(false_mod))
+exp(coefci(false_mod, vcov = vcovCL, cluster = df_pre$cohort_id))
+
+#2nd Falsification Test is Below Where we Use Instrument in Pre Implementation Cohort and Find it to be a Weak Instrument
+
+```
+
+
+```{r 2SLS for Primary Outcome}
+#Run 2SLS for Post Implementation Period and Pre-Implementation Period Separately
+#Model Form
+#1st Stage: pall_2day_note vs days to pall_2day_note ~ trigger_pat_d01 + sat_sun
+#2nd Stage: log(dnrdays) ~ predicted(pall_2day_note) + Age + Race + Ind_Mortality + Day1 MAX SOFA + Code Stat at Admission
+#Needs Robust Standard Errors (Cluster or No Cluster) and clustered by cohort_id
+
+df_post <- pall_df |> filter(post_pallimp==1)
+#2SLS: Need to include 'exogenous' variables on both sides of formula, where they serve as 'instruments' for themselves
+#Log Transformed Outcome
+mod_iv <- ivreg(log(dnr_icudc_outcome) ~ 
+                  pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + 
+                  maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + 
+                  sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_iv, vcovCL(mod_iv, cluster = df_post$cohort_id))
+#Get Exponentiated Coefficients and Confindence Intervals
+# Extracting coefficients and confidence intervals
+estimates <- exp(coef(mod_iv))
+ci <- exp(coefci(mod_iv, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Doing this in the Pre-Implementation Period is a Second Falsification Test of Sorts
+print('Pre Implementation Period')
+df_pre <- pall_df |> filter(post_pallimp==0)
+#2SLS: Need to include 'exogenous' variables (I think covariates) on both sides of formula, where they serve as 'instruments' for themselves
+#Log Transformed Outcome
+mod_iv <- ivreg(log(dnr_icudc_outcome) ~ 
+                  pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_pre)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_iv, vcovCL(mod_iv, cluster = df_pre$cohort_id))
+#Get Exponentiated Coefficients and Confindence Intervals
+estimates <- exp(coef(mod_iv))
+ci <- exp(coefci(mod_iv, vcov = vcovCL, cluster = df_pre$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+```
+
+
+```{r 2SLS Regressions for Secondary Outcomes}
+#SECONDARY OUTCOMES
+#Hospital LOS
+#ICU LOS
+#Death by Day 30
+#Discharge to Hospice
+#In-hospital Cardiac Arrest
+
+df_post <- pall_df |> filter(post_pallimp==1)
+#Hospital Length of Stay
+mod_hosp_los <- ivreg(log(hosp_los_outcome) ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_hosp_los, vcovCL(mod_hosp_los, cluster = df_post$cohort_id))
+#Get Exponentiated Coefficients and Confindence Intervals
+# Extracting coefficients and confidence intervals
+estimates <- exp(coef(mod_hosp_los))
+ci <- exp(coefci(mod_hosp_los, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#ICU Length of Stay
+mod_icu_los <- ivreg(log(icu_los_outcome) ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_icu_los, vcovCL(mod_icu_los, cluster = df_post$cohort_id))
+#Get Exponentiated Coefficients and Confindence Intervals
+estimates <- exp(coef(mod_icu_los))
+ci <- exp(coefci(mod_icu_los, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Death by Day 30 (using OLS with robust standard this will be on absolute % difference)
+mod_death30 <- ivreg(death30 ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_death30, vcovCL(mod_death30, cluster = df_post$cohort_id))
+coefci(mod_death30, vcov = vcovCL, cluster = df_post$cohort_id)
+
+#Discharge to Hospice (using OLS with robust standard this will be on absolute % difference)
+mod_hospice <- ivreg(dc_hospice ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_hospice, vcovCL(mod_hospice, cluster = df_post$cohort_id))
+#Get Confindence Intervals
+coefci(mod_hospice, vcov = vcovCL, cluster = df_post$cohort_id)
+
+#In Hospital Death (using OLS with robust standard this will be on absolute % difference)
+mod_inhosp_death <- ivreg(inhosp_death ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_inhosp_death, vcovCL(mod_inhosp_death, cluster = df_post$cohort_id))
+coefci(mod_inhosp_death, vcov = vcovCL, cluster = df_post$cohort_id)
+
+#In ICU (using OLS with robust standard this will be on absolute % difference)
+mod_inicu_death <- ivreg(in_icu_death ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_inicu_death, vcovCL(mod_inicu_death, cluster = df_post$cohort_id))
+#Get =Confindence Intervals
+coefci(mod_inicu_death, vcov = vcovCL, cluster = df_post$cohort_id)
+
+#In ICU (using OLS with robust standard this will be on absolute % difference)
+mod_to_dnr <- ivreg(to_dnr ~ pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(mod_to_dnr, vcovCL(mod_to_dnr, cluster = df_post$cohort_id))
+#Get =Confindence Intervals
+coefci(mod_to_dnr, vcov = vcovCL, cluster = df_post$cohort_id)
+```
+
+```{r Interrupted Time Series Approach}
+#First Visualize Primary Outcome Overtime
+pall_df <- pall_df |>
+  mutate(icu_in_temp=as.Date(icu_in_dttm)) |>
+  mutate(first_day=as.Date('2021-10-04')) |>
+  mutate(study_day=as.duration(icu_in_temp-first_day)/ddays(1) + 1)
+print('What Day Does the Post Implementation Period Start?...Duh...')
+print(mean(pall_df$study_day[pall_df$icu_in_temp=='2022-10-04']))
+
+#Visualize dnr_icudc_outcome by study day
+ggplot(pall_df, 
+       aes(x = study_day, y = log(dnr_icudc_outcome))) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth(aes(x = study_day, y = log(dnr_icudc_outcome), group = post_pallimp),
+              method = "lm", method.args = list(family = "gaussian")) +
+  scale_x_continuous(breaks=seq(0,730, by=60)) +
+  labs(x = 'Study Day', y = "Days to DNR or ICU DC (Log Scale)\nDeath with no DNR Placed at 99th %Tile") +
+  geom_vline(xintercept = 366) +
+  theme_classic()
+ggsave('ITS_dnricu_outcome.pdf',
+       path='graphs/')
+
+ggplot(pall_df, 
+       aes(x = study_day, y = log(hosp_los_outcome))) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth(aes(x = study_day, y = log(hosp_los_outcome), group = post_pallimp),
+              method = "lm", method.args = list(family = "gaussian")) +
+  scale_x_continuous(breaks=seq(0,730, by=60)) +
+  labs(x = 'Study Day', y = "Hospital Length of Stay Outcome\n(Log Scale)") +
+  geom_vline(xintercept = 366) +
+  theme_classic()
+ggsave('ITS_hosplos.pdf',
+       path='graphs/')
+
+ggplot(pall_df, 
+       aes(x = study_day, y = log(icu_los_outcome))) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth(aes(x = study_day, y = log(icu_los_outcome), group = post_pallimp),
+              method = "lm", method.args = list(family = "gaussian")) +
+  scale_x_continuous(breaks=seq(0,730, by=60)) +
+  labs(x = 'Study Day', y = "ICU Length of Stay Outcome\n(Log Scale)") +
+  geom_vline(xintercept = 366) +
+  theme_classic()
+ggsave('ITS_iculos.pdf',
+       path='graphs/')
+
+df <- pall_df |>
+  mutate(dnr_graph=fifelse(dnr_icudc_outcome>30, 35, dnr_icudc_outcome))
+ggplot(df, 
+       aes(x = study_day, y = dnr_graph)) +
+  geom_jitter(height = 0.1, width = 2, alpha = 0.25, size = 0.5) +
+  geom_smooth(aes(x = study_day, y = dnr_graph, group = post_pallimp),
+              method = "lm", method.args = list(family = "gaussian")) +
+  scale_x_continuous(breaks=seq(0,730, by=60)) +
+  scale_y_continuous(breaks=seq(0,35, by=5),
+                     labels = c('0', '5', '10', '15', '20', '25', '30', '30+')) +
+  labs(x = 'Study Day', y = "Days to DNR or ICU DC\nDeath Placed at 99th Tile") +
+  geom_vline(xintercept = 366) +
+  theme_classic()
+ggsave('ITS_dnricu_d30.pdf',
+       path='graphs/')
+
+#ITS Model Primary Outcome - Uses Cluster Robust Standard Errors
+pall_df <- pall_df |> mutate(study_days30=study_day/30)
+its_mod_dnr <- lm(log(dnr_icudc_outcome) ~ 
+                post_pallimp + study_days30 + post_pallimp:study_days30 + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for Dyas to DNR or ICU Discharge \n")
+coeftest(its_mod_dnr, vcov. = vcovCL(its_mod_dnr, cluster = pall_df$cohort_id))
+estimates <- exp(coef(its_mod_dnr))
+ci <- exp(coefci(its_mod_dnr, vcov = vcovCL, cluster = pall_df$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+
+#SECONDARY OUTCOME ITS MODELS
+#Hospital Length of Stay
+its_mod_hosp <- lm(log(hosp_los_outcome) ~ 
+                post_pallimp + study_days30 +post_pallimp:study_days30 + Age_ICUAdm + race +
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for Hospital LOS \n")
+coeftest(its_mod_hosp, vcov. = vcovCL(its_mod_hosp, cluster = pall_df$cohort_id))
+estimates <- exp(coef(its_mod_hosp))
+ci <- exp(coefci(its_mod_hosp, vcov = vcovCL, cluster = pall_df$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#ICU Length of Stay
+its_mod_icu <- lm(log(icu_los_outcome) ~ 
+                post_pallimp + study_days30 +post_pallimp:study_days30 + Age_ICUAdm + race + 
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for ICU LOS \n")
+coeftest(its_mod_icu, vcov. = vcovCL(its_mod_icu, cluster = pall_df$cohort_id))
+estimates <- exp(coef(its_mod_icu))
+ci <- exp(coefci(its_mod_icu, vcov = vcovCL, cluster = pall_df$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Death by 30 Days
+its_death <- lm(death30 ~ 
+                post_pallimp + study_days30 +post_pallimp:study_days30 + Age_ICUAdm + race +  
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for Death by Day 30 \n")
+coeftest(its_death, vcov. = vcovCL(its_death, cluster = pall_df$cohort_id))
+confint(its_death, vcov. = vcovCL(its_death, cluster = pall_df$cohort_id))
+
+#ITS to DNR
+its_dnr <- lm(to_dnr ~ 
+                post_pallimp + study_days30 + post_pallimp:study_days30 + Age_ICUAdm + race + 
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for Death by Day 30 \n")
+coeftest(its_dnr, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+confint(its_dnr, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+
+#ITS to Hospice
+its_hospice <- lm(dc_hospice ~ 
+                post_pallimp + study_days30 + post_pallimp:study_days30 + Age_ICUAdm + race + 
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for HOspice Discharge \n")
+coeftest(its_hospice, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+confint(its_hospice, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+
+#ITS ICU Death
+its_icu_death <- lm(in_icu_death ~ 
+                post_pallimp + study_days30 + post_pallimp:study_days30 + Age_ICUAdm + race + 
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for HOspice Discharge \n")
+coeftest(its_icu_death, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+confint(its_icu_death, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+
+#ITS Hospital Death Death
+its_hosp_death <- lm(inhosp_death ~ 
+                post_pallimp + study_days30 + post_pallimp:study_days30 + Age_ICUAdm + race + 
+                  Ind_Mortality + maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm, data = pall_df)
+cat("\n ITS for HOspice Discharge \n")
+coeftest(its_hosp_death, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+confint(its_hosp_death, vcov. = vcovCL(its_dnr, cluster = pall_df$cohort_id))
+```
+
+```{r Cumulative Incidence Figure, Through Day 60}
+library(survival)
+library(ggsurvfit)
+
+#Create Competing Risk Outcome, will calculate through day 60
+pall_df <- pall_df |>
+  #Define Competing Risk States
+  mutate(cmprsk_dnr = fcase(
+    #Died with no DNR in ICU (Competing Risk) 33/40 deaths with no DNR are in ICU deaths
+    death_no_dnr==1, 2,
+    #Primary Outcome - Days to DNR or ICU DC
+    death_no_dnr==0 & dnr_icudc_outcome<=60, 1,
+    death_no_dnr==0 & dnr_icudc_outcome>60, 0)) |> #Censored 
+  mutate(cmprsk_dnr=factor(cmprsk_dnr, 0:2, 
+                           labels=c("Censored", "DNR or ICU DC", "Died with no DNR"))) |>
+  #Now Define Time at Risk
+  mutate(dnrrisk_time=fcase(
+    cmprsk_dnr=="Censored", 60.1,
+    cmprsk_dnr=="DNR or ICU DC", dnr_icudc_outcome,
+    cmprsk_dnr=="Died with no DNR", dnr_icudc_outcome))
+
+#Look at Distribution of Competing Risk Events
+df_post <- pall_df |> filter(post_pallimp==1)
+print('Post Implementation Period: Competing Risk Events')
+PercTable(table(pall_df$cmprsk_dnr[pall_df$post_pallimp==1]), rfrq = '001')
+
+df_pre <- pall_df |> filter(post_pallimp==0)
+print('Pre Implementation Period: Competing Risk Events')
+PercTable(table(pall_df$cmprsk_dnr[pall_df$post_pallimp==0]), rfrq = '001')
+
+#Now Create Fine and Gray Model
+fg_df <- finegray(Surv(dnrrisk_time, cmprsk_dnr) ~ ., 
+                  data = df_post,  # Corrected to use tempdf
+                  etype = 'DNR or ICU DC')
+
+fg_fit <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                  pall_2day_note,
+                data = fg_df,  #Uses fg_df
+                weight = fg_df$fgwt)
+
+#Create Cumulative Incidence Curves
+fg_survfit2 <-survfit(Surv(fgstart, fgstop, fgstatus) ~ 
+                        pall_2day_note,
+                      data = fg_df,  # Corrected to use fg_df
+                      weight = fgwt)
+
+print(days_dnr <- ggsurvfit(
+  fg_survfit2,
+  linetype_aes = TRUE, 
+  type = 'risk') +
+    labs(
+      x = "Days",
+      y = "DNR or ICU Discharge"
+    ) + 
+    scale_y_continuous(
+      limits = c(0, 1),
+      labels = scales::percent, 
+      expand = c(0.01, 0)
+    ) +
+    scale_x_continuous(breaks = seq(0, 60, by = 15), expand = c(0.02, 0)) +
+    scale_color_manual(values = c("#FF9900", "#6666FF"),
+                       limits = c("pall_2day_note=1", "pall_2day_note=0"),
+                       labels = c("Screened","Not Screened"),
+                       name = 'Screen Status') +
+    scale_linetype_manual(values = c(6,1),
+                          limits = c("pall_2day_note=1", "pall_2day_note=0"),
+                          labels = c("Screened","Not Screened"),
+                          name = 'Screen Status') +
+    ggtitle('Post Palliative Care Implementation') +
+    theme_classic() +
+    theme(legend.title = element_text(size=8),
+    legend.text= element_text(size=8),
+    legend.position = c(0.85,0.25)))
+ggsave("Days_to_DNR_PostPallimp.pdf",
+       device = "pdf",
+       path='graphs/')
+
+#Now Repeat For Pre Pall Imp
+df_pre <- pall_df |> filter(post_pallimp==0)
+
+fg_df <- finegray(Surv(dnrrisk_time, cmprsk_dnr) ~ ., 
+                  data = df_pre,  # Corrected to use tempdf
+                  etype = 'DNR or ICU DC')
+
+fg_fit <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                  pall_2day_note,
+                data = fg_df,  #Uses fg_df
+                weight = fg_df$fgwt)
+
+#Create Cumulative Incidence Curves
+fg_survfit2 <-survfit(Surv(fgstart, fgstop, fgstatus) ~ 
+                        pall_2day_note,
+                      data = fg_df,  # Corrected to use fg_df
+                      weight = fgwt)
+
+print(days_dnr <- ggsurvfit(
+  fg_survfit2,
+  linetype_aes = TRUE, 
+  type = 'risk') +
+    labs(
+      x = "Days",
+      y = "DNR or ICU Discharge"
+    ) + 
+    scale_y_continuous(
+      limits = c(0, 1),
+      labels = scales::percent, 
+      expand = c(0.01, 0)
+    ) +
+    scale_x_continuous(breaks = seq(0, 60, by = 15), expand = c(0.02, 0)) +
+    scale_color_manual(values = c("#FF9900", "#6666FF"),
+                       limits = c("pall_2day_note=1", "pall_2day_note=0"),
+                       labels = c("Screened","Not Screened"),
+                       name = 'Screen Status') +
+    scale_linetype_manual(values = c(6,1),
+                          limits = c("pall_2day_note=1", "pall_2day_note=0"),
+                          labels = c("Screened","Not Screened"),
+                          name = 'Screen Status') +
+    ggtitle('Pre Palliative Care Implementation') +
+    theme_classic() +
+    theme(legend.title = element_text(size=8),
+    legend.text= element_text(size=8),
+    legend.position = c(0.85,0.25)))
+ggsave("Days_to_DNR_Prepallimp.pdf",
+       device = "pdf",
+       path='graphs/')
+
+```
+
+```{r Supplementary Tables of Palliative Care Triggers}
+#Code below puts all pall care triggers in a vector
+to_tab <- names(pall_df)[16:29]
+factors_tab <- to_tab
+#Now Create Table 1 for Post_implementation Period and Stratified by Receipt of Palliative Care Within 2 Days (by Note)
+
+df <- pall_df |> filter(post_pallimp==1) 
+df_clust <- svydesign(data = df, ids = df$cohort_id)
+#Now Create a Traditional Table 1, Using Non-parametric Testing, Stratified by Pall 2 Day Note
+tab_trig <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Post-Implementation Period Table of Triggers')
+print(tab_trig, nonnormal=nonnorm)
+tab_trig_excel <- print(tab_trig, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab_trig_excel, file="tables/table_trig_by_pallrecieved2d_note_postimp.csv")
+
+#Repeat for The Pre-Implementation Period
+df <- pall_df |> filter(post_pallimp==0) 
+df_clust <- svydesign(data = df, ids = df$cohort_id)
+#Now Create a Traditional Table 1, Using Non-parametric Testing, Stratified by Pall 2 Day Note
+tab_trig <- svyCreateTableOne(vars = to_tab, strata="pall_2day_note", data=df_clust, factorVars = factors_tab, addOverall = TRUE)
+print('Pre-Implementation Period Table of Triggers')
+print(tab_trig, nonnormal=nonnorm)
+tab_trig_excel <- print(tab_trig, nonnorm=nonnorm, printToggle = FALSE)
+write.csv(tab_trig_excel, file="tables/table_trig_by_pallrecieved2d_note_preimp.csv")
+rm(tab_trig_excel, tab_trig)
+```
+
+```{r Unadjusted and Adjusted Regression Models - NOT INSTRUMENTAL VARIABLES}
+#Post period ONLY
+df_post <- pall_df |> filter(post_pallimp==1)
+#Linear Regression with Log Transformed Outcome
+#Unadjusted
+mod <- lm(log(dnr_icudc_outcome) ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n Primary Outcome Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- exp(coef(mod))
+ci <- exp(coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(log(dnr_icudc_outcome) ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n Primary Outcome Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- exp(coef(mod))
+ci <- exp(coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+###SECONDARY OUTCOMES - Linear Regressions
+#Unadjusted
+mod <- lm(log(icu_los) ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n ICU LOS: Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- exp(coef(mod))
+ci <- exp(coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(log(icu_los) ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n ICU LOS Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- exp(coef(mod))
+ci <- exp(coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Unadjusted
+mod <- lm(log(hosp_los) ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n Hospital LOS: Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- exp(coef(mod))
+ci <- exp(coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(log(hosp_los) ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n Hospital LOS Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- exp(coef(mod))
+ci <- exp(coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Unadjusted
+mod <- lm(dc_hospice ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n DC Hospice: Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(dc_hospice ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n DC Hospice Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Unadjusted
+mod <- lm(in_icu_death ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n in-ICU Death: Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(in_icu_death ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n in_icu_death Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Unadjusted
+mod <- lm(inhosp_death ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n In-Hospital Death: Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(inhosp_death ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n In-Hospital Death Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+#Unadjusted
+mod <- lm(death30 ~ 
+            pall_2day_note, 
+          data=df_post)
+cat("\n 30-day Mortality: Unadjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#Adjusted
+mod <- lm(death30 ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n 30-day Mortality Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+
+#To DNR
+mod <- lm(to_dnr ~ 
+            pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm, 
+          data=df_post)
+cat("\n Change to DNR, Adjusted Lineary Regression \n")
+coeftest(mod, vcov. = vcovCL(mod, cluster = df_post$cohort_id))
+estimates <- coef(mod)
+ci <- coefci(mod, vcov = vcovCL, cluster = df_post$cohort_id)
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+```
+
+#To get cluster robust standard errors for linear combination used: https://stackoverflow.com/questions/40120094/how-to-conduct-linear-hypothesis-test-on-regression-coefficients-with-a-clustere
+```{r Interaction Term with Race}
+#Will Define the Interaction Term Using Nonwhite vs White
+df_post <- pall_df |> filter(post_pallimp==1) |>
+  mutate(nonwhite=fifelse(race!='White', 1, 0))
+
+interact_iv <- ivreg(log(dnr_icudc_outcome) ~ 
+                  Age_ICUAdm + nonwhite:pall_2day_note + nonwhite + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | pall_2day_note | trigger_pat_d01 + 
+                  sat_sun, 
+                data=df_post)
+#Model Results with Clustered Robust Standard Errors
+summary(interact_iv, vcovCL(interact_iv, cluster = df_post$cohort_id))
+#Get Exponentiated Coefficients and Confindence Intervals
+estimates <- exp(coef(interact_iv))
+ci <- exp(coefci(interact_iv, vcov = vcovCL, cluster = df_post$cohort_id))
+# Combining them into a dataframe
+result <- data.frame(
+  'Exponentiated Estimate' = estimates,
+  'Lower CI' = ci[,1],
+  'Upper CI' = ci[,2]
+)
+print(result)
+#Also Check the linear combination of pall_2day and pall2daynonwhite
+summary(glht(interact_iv, linfct = c('pall_2day_note+pall_2day_note:nonwhite=0')))
+
+#Now to Get the Clustered Standard Errors
+LinearCombTest <- function (lmObject, vars, .vcov = NULL) {
+  ## if `.vcov` missing, use the one returned by `lm`
+  if (is.null(.vcov)) .vcov <- vcov(lmObject)
+  ## estimated coefficients
+  beta <- coef(lmObject)
+  ## sum of `vars`
+  sumvars <- sum(beta[vars])
+  ## get standard errors for sum of `vars`
+  se <- sum(.vcov[vars, vars]) ^ 0.5
+  ## perform t-test on `sumvars`
+  tscore <- sumvars / se
+  pvalue <- 2 * pt(abs(tscore), lmObject$df.residual, lower.tail = FALSE)
+  ## return a matrix
+  matrix(c(sumvars, se, tscore, pvalue), nrow = 1L,
+         dimnames = list(paste0(paste0(vars, collapse = " + "), " = 0"),
+                         c("Estimate", "Std. Error", "t value", "Pr(>|t|)")))
+}
+vcv <- vcovCL(interact_iv, cluster = df_post$cohort_id)
+unex <- LinearCombTest(interact_iv, c("pall_2day_note","pall_2day_note:nonwhite"), vcv)
+estimates <- exp(unex[1])
+ul <- exp((unex[1]) + 1.96*unex[2])
+ll <- exp((unex[1]) - 1.96*unex[2])
+cbind('Exponentiated Estimate of Pall_2day_note in nonWhite' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+
+```
+
+
+```{r One more Falsification Test}
+#Test for Association Between Instrument and Residuals from the SEcond Stage of the primary model
+df_post<- pall_df |> filter(post_pallimp==1) 
+#2SLS: Need to include 'exogenous' variables on both sides of formula, where they serve as 'instruments' for themselves
+#Log Transformed Outcome
+mod_iv <- ivreg(log(dnr_icudc_outcome) ~ 
+                  pall_2day_note + Age_ICUAdm + race + Ind_Mortality + maxsofa_day1_2 + 
+                  CodeStatus_in6HrAfterICUAdm | Age_ICUAdm + race + Ind_Mortality + 
+                  maxsofa_day1_2 + CodeStatus_in6HrAfterICUAdm + trigger_pat_d01 + 
+                  sat_sun, 
+                data=df_post)
+
+resid_df <- mod_iv$model |>
+  mutate(resids_2nd=mod_iv$residuals2)
+
+
+check_res <- lm(resids_2nd ~ trigger_pat_d01 + sat_sun, data=resid_df)
+summary(check_res)
+```
+
+```{r Get Data for Consort Stratified by Pre-Post Implementation}
+#NOTE: Because of the Way Filtering Was Done; 6 Patients in Post Period Were Taken Out Because It's the 2nd ICU Admission within a Hospitalization that Began Before the PC Intervention. They have been Appropriately excluded and will be exluded here
+
+df_con <- open_dataset(here::here('data', 'pall_df_altdate.parquet')) |> 
+  collect() |>
+  mutate(post_pallimp=fifelse(
+    icu_in_dttm>='2022-10-04', 1, 0
+  )) |>
+  filter(icu_in_dttm>='2021-10-04' & icu_in_dttm<'2023-10-04') |>
+  mutate(icu_los=as.duration(icu_out_dttm-icu_in_dttm)/ddays(1)) |>
+  select(cohort_id, pat_enc_csn_id, pat_service_c, adt_department_name, ed_to_icu:day1_2_admits, post_pallimp, icu_los) |>
+  mutate(exclude=fifelse(pat_enc_csn_id %in% 
+           c(1346802815547377, 3059950648041804, 1242905489141632) & post_pallimp==1, 1, 0)) |>
+  filter(exclude==0)
+dim(df_con)
+
+pre_con <- df_con |> filter(post_pallimp==0)
+post_con <- df_con |> filter(post_pallimp==1)
+
+fn.consort <- function(x, y) {
+cat('Flow Diagram Data for', y)
+cat('\n', dim(x)[1], 'ICU Encounters During Date Range')
+
+#Exclusion: 
+#1: Only include the 1st ICU stay for a patient for each hospitalization
+#2: 'No CPR - Palliative and Supportive Care' within 6 Hours of Admission
+#3: <12 Hours Between ICU Admission and Discharge
+#4: Had billing code for palliative care prior to icu_in_dttm
+
+#1
+n <- dim(x)[1] #Keep Track of Length and How Many Encounters are Excluded
+x <- x |>
+  group_by(pat_enc_csn_id) |>
+  arrange(icu_in_dttm) |>
+  mutate(icu_number=row_number()) |>
+  mutate(total_icu_admits=max(icu_number)) |> #Keeps Track of the Total Number of ICU Stays per Patient Encounter
+  filter(icu_number==1) |>
+  ungroup()
+cat('\n', n-dim(x)[1], 'Excluded Additional ICU Stays in Same Encounter')
+
+#2
+n <- dim(x)[1] #Keep Track of Length and How Many Encounters are Excluded
+x <- x |>
+  filter(CodeStatus_in6HrAfterICUAdm!='No CPR - Palliative and Supportive Care')
+cat('\n', n-dim(x)[1], 'Excluded For Comfort Care STatus in 1st 6 Hours')
+n <- dim(x)[1]
+
+#3
+x <- x |>
+  filter(icu_los>=0.5)
+cat('\n', n-dim(x)[1], 'Excluded For < 12 Hours Between ICU Admission and ICU Discharge')
+n <- dim(x)[1]
+
+#4 Billing COde or Palliative Care Consult
+x <- x |>
+  filter(is.na(PCC_firstDttm_HospEnc_byBill) | PCC_firstDttm_HospEnc_byBill>icu_in_dttm) |>
+  filter(is.na(firstDate_NoteType_Consults) | firstDate_NoteType_Consults>date_admit)
+cat('\n', n-dim(x)[1], 'Excluded For Palliative Care Bill Prior to ICU')
+n <- dim(x)[1]
+cat('\n', "Final Number of ICU Encounters", n)
+cat('\n', " ")
+
+x <- x
+}
+
+y <- 'Pre-Implementation Cohort'
+pre_con <- fn.consort(pre_con, y)
+y <- 'Post-Implementation Cohort'
+post_con <- fn.consort(post_con, y)
+
+```
+
+
+```{r Get Exponentiated Linear Combination STudy Days 30 and Pall Screening}
+print('ITS_Mod_DNR')
+vcv <- vcovCL(its_mod_dnr, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_mod_dnr, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- exp(unex[1])
+ul <- exp((unex[1]) + 1.96*unex[2])
+ll <- exp((unex[1]) - 1.96*unex[2])
+cbind('Exponentiated Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS_Mod_ICU Length of Stay')
+vcv <- vcovCL(its_mod_icu, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_mod_icu, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- exp(unex[1])
+ul <- exp((unex[1]) + 1.96*unex[2])
+ll <- exp((unex[1]) - 1.96*unex[2])
+cbind('Exponentiated Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS_Mod_Hospital Length of Stay')
+vcv <- vcovCL(its_mod_hosp, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_mod_hosp, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- exp(unex[1])
+ul <- exp((unex[1]) + 1.96*unex[2])
+ll <- exp((unex[1]) - 1.96*unex[2])
+cbind('Exponentiated Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS Change to DNR')
+vcv <- vcovCL(its_dnr, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_dnr, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- unex[1]
+ul <- unex[1] + (1.96*unex[2])
+ll <- unex[1] - (1.96*unex[2])
+cbind('Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS Death by Day 30')
+vcv <- vcovCL(its_death, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_death, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- unex[1]
+ul <- unex[1] + (1.96*unex[2])
+ll <- unex[1] - (1.96*unex[2])
+cbind('Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS In ICU Death')
+vcv <- vcovCL(its_icu_death, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_icu_death, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- unex[1]
+ul <- unex[1] + (1.96*unex[2])
+ll <- unex[1] - (1.96*unex[2])
+cbind('Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS In Hospital Death')
+vcv <- vcovCL(its_hosp_death, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_hosp_death, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- unex[1]
+ul <- unex[1] + (1.96*unex[2])
+ll <- unex[1] - (1.96*unex[2])
+cbind('Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+
+print('ITS DC Hospice')
+vcv <- vcovCL(its_hospice, cluster = pall_df$cohort_id)
+unex <- LinearCombTest(its_hospice, c("study_days30", "post_pallimp:study_days30"), vcv)
+estimates <- unex[1]
+ul <- unex[1] + (1.96*unex[2])
+ll <- unex[1] - (1.96*unex[2])
+cbind('Estimate Of Post Palliative Care Time Trend' = estimates,
+      '95% CI Lowwer' = ll,
+      '95% CI Upper' = ul)
+```
+
+
+
